@@ -6,3 +6,4 @@ matplotlib
 networkx
 matplotlib
 python-louvain
+infomap
