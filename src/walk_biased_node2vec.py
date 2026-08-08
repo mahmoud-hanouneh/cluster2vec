@@ -54,10 +54,12 @@ def first_order_cluster_probs(v, alpha, beta):
     return nbrs, w / w.sum()
 
 # 3) - The general engine: node2vec search bias x cluster bias
-def cluster_node2vec_probs(t, v, p, q, alpha, beta):
+def cluster_node2vec_probs(t, v, p, q, alpha, beta, r):
     nbrs = neighbors[v]
     w = np.empty(len(nbrs))
+    just_crossed = (t is not None) and (cluster[t] != cluster[v])
     for i, x in enumerate(nbrs):
+        # Node2vec search bias 
         if t is None:
             a = 1.0
         elif x == t:
@@ -66,8 +68,11 @@ def cluster_node2vec_probs(t, v, p, q, alpha, beta):
             a = 1.0
         else:
             a = 1.0 / q
+        # cluster-crossing bias
         c = alpha if cluster[x] == cluster[v] else beta
-        w[i] = a * c
+        # anti-return: just crossed a border -> penalise walking back into it
+        m = r if (just_crossed and cluster[x] == cluster[t]) else 1.0
+        w[i] = a * c * m
     return nbrs, w / w.sum()
 
 
@@ -90,16 +95,16 @@ def max_diff(rule_a, rule_b):
 
 print("Reduction tests (max difference in transition probability):")
 for (p, q) in [(1.0, 1.0), (0.5, 2.0), (4.0, 0.25)]:
-    d1 = max_diff(lambda t, v: cluster_node2vec_probs(t, v, p, q, 1.0, 1.0),
+    d1 = max_diff(lambda t, v: cluster_node2vec_probs(t, v, p, q, 1.0, 1.0, 1.0),
                   lambda t, v: node2vec_probs(t, v, p, q))
-    print(f"  Test 1  alpha=beta=1, p={p}, q={q}: "
+    print(f"  Test 1  alpha=beta=1, r=1, p={p}, q={q}: "
           f"cluster-N2V vs Node2Vec         diff = {d1:.2e}  "
           f"{'PASS' if d1 < 1e-12 else 'FAIL'}")
 
 for (alpha, beta) in [(0.5, 2.0), (0.2, 3.0)]:
-    d2 = max_diff(lambda t, v: cluster_node2vec_probs(t, v, 1.0, 1.0, alpha, beta),
+    d2 = max_diff(lambda t, v: cluster_node2vec_probs(t, v, 1.0, 1.0, alpha, beta, 1.0),
                   lambda t, v: first_order_cluster_probs(v, alpha, beta))
-    print(f"  Test 2  p=q=1, alpha={alpha}, beta={beta}: "
+    print(f"  Test 2  p=q=1, r=1 , a={alpha}, b={beta}: "
           f"cluster-N2V vs first-order walk  diff = {d2:.2e}  "
           f"{'PASS' if d2 < 1e-12 else 'FAIL'}")
 print()
@@ -108,22 +113,33 @@ print()
 
 ##### See the bias concretely on one node #####
 
-# Pick a node that has neighbors in both its own and other clusters.
-demo = next(v for v in range(n)
-            if len({cluster[x] for x in neighbors[v]} | {cluster[v]}) > 1)
-nbrs, plain = node2vec_probs(None, demo, 1.0, 0.5)
-_, biased = cluster_node2vec_probs(None, demo, 1.0, 0.5, 0.5, 2.0)
-print(f"Transition from node {demo} (cluster {cluster[demo]}), first step:")
-for x, pp, bb in zip(nbrs, plain, biased):
-    tag = "same" if cluster[x] == cluster[demo] else "DIFF"
-    print(f"   -> {x:2d} ({tag} cluster {cluster[x]}):  plain {pp:.3f}   biased {bb:.3f}")
+t0, v0 = next((int(t), v) for v in range(n) for t in neighbors[v]
+              if cluster[t] != cluster[v])
+nbrs, off = cluster_node2vec_probs(t0, v0, 1.0, 0.5, 0.5, 2.0, 1.0)
+_, on = cluster_node2vec_probs(t0, v0, 1.0, 0.5, 0.5, 2.0, 0.001)
+print(f"Just crossed  {t0}(cl {cluster[t0]}) -> {v0}(cl {cluster[v0]}).  Next step:")
+for x, o, nn in zip(nbrs, off, on):
+    back = "BACK" if cluster[x] == cluster[t0] else "fwd "
+    print(f"   -> {x:2d} ({back}, cl {cluster[x]}):  r=1 {o:.3f}   r=1/1000 {nn:.3f}")
 print()
+
+
+# Pick a node that has neighbors in both its own and other clusters.
+# demo = next(v for v in range(n)
+#             if len({cluster[x] for x in neighbors[v]} | {cluster[v]}) > 1)
+# nbrs, plain = node2vec_probs(None, demo, 1.0, 0.5)
+# _, biased = cluster_node2vec_probs(None, demo, 1.0, 0.5, 0.5, 2.0)
+# print(f"Transition from node {demo} (cluster {cluster[demo]}), first step:")
+# for x, pp, bb in zip(nbrs, plain, biased):
+#     tag = "same" if cluster[x] == cluster[demo] else "DIFF"
+#     print(f"   -> {x:2d} ({tag} cluster {cluster[x]}):  plain {pp:.3f}   biased {bb:.3f}")
+# print()
 
 
 
 ##### Walks -> skip-gram (shared trainer, stabilized) #####                          
 
-def generate_walks(p, q, alpha, beta, num_walks=20, walk_len=40, seed=0):
+def generate_walks(p, q, alpha, beta, r, num_walks=20, walk_len=40, seed=0):
     rng = np.random.default_rng(seed)
     walks = []
     for _ in range(num_walks):
@@ -132,7 +148,7 @@ def generate_walks(p, q, alpha, beta, num_walks=20, walk_len=40, seed=0):
             while len(walk) < walk_len:
                 v = walk[-1]
                 t = walk[-2] if len(walk) > 1 else None
-                nbrs, probs = cluster_node2vec_probs(t, v, p, q, alpha, beta)
+                nbrs, probs = cluster_node2vec_probs(t, v, p, q, alpha, beta, r)
                 walk.append(int(rng.choice(nbrs, p=probs)))
             walks.append(walk)
     return walks
@@ -178,18 +194,35 @@ def train_sgns(pairs, neg_dist, dim=16, steps=4000, batch=256,
 neg_dist = deg ** 0.75
 neg_dist /= neg_dist.sum()
 
-def embed(p, q, alpha, beta):
-    walks = generate_walks(p, q, alpha, beta, seed=SEED)
-    return train_sgns(walk_pairs(walks), neg_dist, seed=SEED)
+# def embed(p, q, alpha, beta):
+#     walks = generate_walks(p, q, alpha, beta, seed=SEED)
+#     return train_sgns(walk_pairs(walks), neg_dist, seed=SEED)
 
 
 ##### Three configurations, same engine, different knobs #####
 
 configs = [
-    ("DeepWalk",          dict(p=1.0, q=1.0, alpha=1.0, beta=1.0)),
-    ("Node2Vec (q=0.5)",  dict(p=1.0, q=0.5, alpha=1.0, beta=1.0)),
-    ("Cluster-N2V",       dict(p=1.0, q=0.5, alpha=0.5, beta=2.0)),
+    ("DeepWalk",          dict(p=1.0, q=1.0, alpha=1.0, beta=1.0, r=1.0)),
+    ("Node2Vec (q=0.5)",  dict(p=1.0, q=0.5, alpha=1.0, beta=1.0, r=1.0)),
+    ("Cluster-N2V",       dict(p=1.0, q=0.5, alpha=0.5, beta=2.0, r=1.0)),
+    ("Cluster-N2V + no-return", dict(p=1.0, q=0.5, alpha=0.5, beta=2.0, r=0.001)),
 ]
+
+def walk_diagnostics(walks):
+    tot_cross = tot_recross = 0
+    coverage = []
+    for walk in walks:
+        cl = [cluster[v] for v in walk]
+        for i in range(1, len(cl)):
+            if cl[i] != cl[i - 1]:               # a border crossing
+                tot_cross += 1
+                if i + 1 < len(cl) and cl[i + 1] == cl[i - 1]:
+                    tot_recross += 1             # immediately reversed
+        coverage.append(len(set(walk)))          # distinct nodes visited
+    avg_cross = tot_cross / len(walks)
+    recross_rate = tot_recross / tot_cross if tot_cross else 0.0
+    return avg_cross, recross_rate, float(np.mean(coverage))
+
 
 def unit(X):
     return X / (np.linalg.norm(X, axis=1, keepdims=True) + 1e-9)
@@ -204,27 +237,39 @@ def evaluate(X):
             X[m], labels[m]).predict(X[i:i+1])[0]
     return ari, accuracy_score(labels, preds)
 
-print("End-to-end on Karate (recovering the two factions):")
+# print("End-to-end on Karate (recovering the two factions):")
 results = []
 for name, kw in configs:
-    X = unit(embed(**kw))
+    walks = generate_walks(**kw, seed=SEED)
+    diag = walk_diagnostics(walks)
+    X = unit(train_sgns(walk_pairs(walks), neg_dist, seed=SEED))
     ari, acc = evaluate(X)
-    results.append((name, X, ari, acc))
-    print(f"  {name:18s}  k-means ARI = {ari:+.3f}   LOO-kNN acc = {acc:.3f}")
+    results.append((name, diag, X, ari, acc))
+    
+print("Walk diagnostics (is the walk stuck oscillating on the border?):")
+print(f"  {'config':<26}{'crossings/walk':>15}{'re-cross rate':>15}{'distinct nodes':>16}")
 
-fig, axes = plt.subplots(1, 3, figsize=(15, 5))
-for ax, (name, X, ari, acc) in zip(axes, results):
+print("End-to-end on Karate (recovering the two factions):")
+
+for name, diag, X, ari, acc in results:
+    print(f"  {name:<26}  k-means ARI = {ari:+.3f}   LOO-kNN acc = {acc:.3f}")
+    # ac, rr, cov = diag
+
+
+fig, axes = plt.subplots(1, 4, figsize=(19, 5))
+
+for ax, (name, diag, X, ari, acc) in zip(axes, results):
     P2 = PCA(n_components=2, random_state=SEED).fit_transform(X)
     for lab, color in [(0, "#2c6fbb"), (1, "#c0392b")]:
         m = labels == lab
-        ax.scatter(P2[m, 0], P2[m, 1], c=color, s=80, edgecolors="white",
-                   linewidths=1.1, label=f"faction {lab}")
+        ax.scatter(P2[m, 0], P2[m, 1], c=color, s=70, edgecolors="white",
+                   linewidths=1.0, label=f"faction {lab}")
     for i in range(n):
-        ax.annotate(str(nodes[i]), (P2[i, 0], P2[i, 1]), fontsize=6.5,
+        ax.annotate(str(nodes[i]), (P2[i, 0], P2[i, 1]), fontsize=6,
                     ha="center", va="center", color="white")
-    ax.set_title(f"{name}\nARI={ari:+.2f}  acc={acc:.2f}", fontsize=11)
+    ax.set_title(f"{name}\nARI={ari:+.2f}  acc={acc:.2f}", fontsize=10)
     ax.set_xticks([]); ax.set_yticks([]); ax.legend(fontsize=8)
-fig.suptitle("Cluster-aware Node2Vec engine on Karate (2D PCA)", fontsize=13)
+fig.suptitle("Anti-return fix on Karate: same engine, r=1 vs r=1/1000 (2D PCA)", fontsize=13)
 fig.tight_layout()
-fig.savefig("karate_step1.png", dpi=130, bbox_inches="tight")
-print("\nsaved figure -> karate_step1.png")
+fig.savefig("karate_antireturn.png", dpi=130, bbox_inches="tight")
+print("\nsaved figure -> karate_antireturn.png")
