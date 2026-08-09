@@ -1,3 +1,12 @@
+"""
+running prototype for the biased walk node2vec after clustering (cluster2vec) performed on Karate
+
+three factors for walk engine:
+1) a_pq 
+2) c (cluster-crossing)
+3) anti-return
+
+"""
 import numpy as np
 import networkx as nx
 from sklearn.cluster import KMeans
@@ -246,7 +255,7 @@ for name, kw in configs:
     ari, acc = evaluate(X)
     results.append((name, diag, X, ari, acc))
     
-print("Walk diagnostics (is the walk stuck oscillating on the border?):")
+print("Walk diagnostics (is the walk stuck oscillating on the border??):")
 print(f"  {'config':<26}{'crossings/walk':>15}{'re-cross rate':>15}{'distinct nodes':>16}")
 
 print("End-to-end on Karate (recovering the two factions):")

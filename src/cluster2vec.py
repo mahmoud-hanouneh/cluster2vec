@@ -1,370 +1,248 @@
 """
-Logic: 
-
-CLUSTER-BIASED node2vec on a Planetoid graph
-
---------
-node2vec's walk picks the next node x from current node v using:
-
-        pi(v -> x) = ß(t, x) * w(v, x)
-
-ß_pq depends on the previous node t (the p/q machinery).
-w(v, x) is just the edge weight (1 for an unweighted graph like Cora).
-
-This cluster bias beta(v, x) depends only on v and x (are they in the same
-cluster? / how deep do they share a cluster?). It does NOT depend on t.
-
-Because of that, we can fold beta straight into the edge weight:
-
-        w'(v, x) = a(v, x) * w(v, x)
-
-Then, run ordinary node2vec. The walk now:
-
-        pi(v -> x) = a_pq(t, x) * ß(v, x) * w(v, x)
-
-A cluster rule with NO rewrite of the library's internals. We still walk only on real edges; we just reweight them.
-
-Two modes
----------
-  flat       : ß = ß_in if v,x share the finest Louvain community,
-               else beta_out.   (one simple knob)
-
-  multiscale : beta interpolates by How Deep v,x share a cluster in the
-               Louvain dendrogram (deep shared cluster -> closer to beta_in,
-               only-share-the-root -> closer to beta_out).   (the "hierarchical"
-               / multi-scale version your topic title asks for)
+Cluster2Vec: cluster-aware Node2Vec + anti-return on Roman-empire
+(a heterophilous graph: ~22.7k nodes, 18 syntactic-role classes).
 
 """
 
-import argparse
-import os
-import random
-import warnings
-
+import time, os
 import numpy as np
 import networkx as nx
+from gensim.models import Word2Vec
+from sklearn.preprocessing import StandardScaler
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import accuracy_score, adjusted_rand_score
 import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 
-import torch
-from torch_geometric.datasets import Planetoid
-from torch_geometric.utils import to_networkx
-
-import community as community_louvain          # python-louvain
-from node2vec import Node2Vec
-from sklearn.linear_model import LogisticRegression
-from sklearn.manifold import TSNE
-from sklearn.metrics import accuracy_score
-
-warnings.filterwarnings("ignore")
+SEED = 7
 
 
 
+# Data: Pytorch-Gemoetric loader & direct-.npz fallback          
 
-# Reproducibility 
-def set_seed(seed):
-    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed)
+def load_roman_empire():
+    try:
+        from torch_geometric.datasets import HeterophilousGraphDataset
+        d = HeterophilousGraphDataset(root="data/heterophilous", name="Roman-empire")[0]
+        edges = d.edge_index.t().cpu().numpy()
+        y = d.y.cpu().numpy()
+        tr = d.train_mask.t().cpu().numpy()   # PyG stores (N, splits) -> (splits, N)
+        te = d.test_mask.t().cpu().numpy()
+        return edges, y, tr, te
+    except Exception:
+        path = "roman_empire.npz"
+        if not os.path.exists(path):
+            import urllib.request
+            urllib.request.urlretrieve(
+                "https://github.com/yandex-research/heterophilous-graphs/"
+                "raw/main/data/roman_empire.npz", path)
+        d = np.load(path)
+        return d["edges"], d["node_labels"], d["train_masks"], d["test_masks"]
 
+# edge list, the per-node labels (18 roles) and 10 train/test split masks
+edges, y, train_masks, test_masks = load_roman_empire()
+n = len(y) # length of nodes 
+n_classes = len(np.unique(y))
+majority = np.bincount(y).max() / n
+print(f"Roman-empire: {n} nodes, {len(edges)} edges, {n_classes} classes")
+print(f"majority-class baseline accuracy = {majority:.3f}\n")
 
-# Load Data 
-def load_planetoid(name, root="data"):
-    data = Planetoid(root=os.path.join(root, name), name=name)[0]
-    G = to_networkx(data, to_undirected=True)
-    y = data.y.numpy()
-    print(f"[data] {name}: {G.number_of_nodes()} nodes, {G.number_of_edges()} edges, "
-          f"{int(y.max()) + 1} classes")
-    return G, y, data.train_mask.numpy(), data.test_mask.numpy()
-
-
-# Train a simple classifier for evaluation
-def evaluate(X, y, train_mask, test_mask, seed):
-    clf = LogisticRegression(max_iter=1000, random_state=seed)
-    clf.fit(X[train_mask], y[train_mask])
-    return accuracy_score(y[test_mask], clf.predict(X[test_mask]))
-
-
-def embeddings_to_matrix(model, N, d):
-    X = np.zeros((N, d), dtype=np.float32)
-    for i in range(N):
-        if str(i) in model.wv:
-            X[i] = model.wv[str(i)]
-    return X
-
-
-# def plot_tsne(X, y, title, path, seed):
-#     coords = TSNE(n_components=2, init="pca", learning_rate="auto",
-#                   random_state=seed).fit_transform(X)
-#     plt.figure(figsize=(7, 6))
-#     sc = plt.scatter(coords[:, 0], coords[:, 1], c=y, s=8, cmap="tab10", alpha=0.8)
-#     plt.legend(*sc.legend_elements(), title="class", loc="best", fontsize=8)
-#     plt.title(title); plt.xticks([]); plt.yticks([]); plt.tight_layout()
-#     plt.savefig(path, dpi=150); plt.close()
-#     print(f"[tsne] saved -> {path}")
+# sparse adjacency (lists + sets); cluster as a plain list for fast lookups
+# building the graph as adjaceny lists 
+G = nx.Graph()
+G.add_nodes_from(range(n))
+G.add_edges_from(map(tuple, edges))
+adj = [list(G.neighbors(i)) for i in range(n)]
+adj_set = [set(a) for a in adj]
 
 
-# 1) Hierarchical clustering (Louvain dendrogram)
-
-# Return a list `level_maps` of {node -> community} dicts, one per level, from Finest (index 0) to Coarest (last index).
-def compute_louvain_levels(G, seed):
-    dendro = community_louvain.generate_dendrogram(G, random_state=seed)
-    level_maps = [community_louvain.partition_at_level(dendro, lvl)
-                  for lvl in range(len(dendro))]
-    sizes = [len(set(m.values())) for m in level_maps]
-    print(f"[louvain] {len(level_maps)} levels; communities per level "
-          f"(fine->coarse): {sizes}")
-    return level_maps
+# Clustering (Louvain) - Not best option for Roman-Empire, to be changed.
+comms = nx.community.louvain_communities(G, seed=SEED)
+cluster = [0] * n
+for cid, c in enumerate(comms):
+    for u in c:
+        cluster[u] = cid
+clu_ari = adjusted_rand_score(y, cluster)
+print(f"Louvain: {len(comms)} communities; alignment with the 18 labels "
+      f"ARI = {clu_ari:+.3f}\n")
 
 
 
-"""
-    This function return a function beta(u, v) used to reweight edge (u, v).
-    flat        -> beta_in if u,v in the same finest community else beta_out.
-    multiscale  -> geometric interpolation by how deep u,v first share a
-                   community: deep (fine level) -> beta_in, shallow/root -> beta_out.
-"""
-def make_beta_fn(level_maps, beta_in, beta_out, mode):
-    H = len(level_maps)
 
-    def beta(u, v):
-        if mode == "flat":
-            same = level_maps[0][u] == level_maps[0][v]
-            return beta_in if same else beta_out
+# Clean transition rules (used by a sampled reduction check)
 
-        # multiscale: find finest level where u, v share a community
-        merge_level = None
-        for lvl in range(H):
-            if level_maps[lvl][u] == level_maps[lvl][v]:
-                merge_level = lvl
-                break
-        if merge_level is None:          # never share -> only meet at the root
-            s = 0.0
-        else:                            # fine merge (small level) -> s near 1
-            s = (H - merge_level) / H
-        return beta_out * (beta_in / beta_out) ** s
+# plain node2vec (p/q factor)
+def node2vec_probs(t, v, p, q):
+    nbrs = adj[v]; w = []
+    for x in nbrs:
+        if t is None:            a = 1.0
+        elif x == t:             a = 1.0 / p
+        elif x in adj_set[t]:    a = 1.0
+        else:                    a = 1.0 / q
+        w.append(a)
+    s = sum(w); return nbrs, [wi / s for wi in w]
 
-    return beta
+# plain cluster bias (alpha & beta)
+def first_order_cluster_probs(v, alpha, beta):
+    nbrs = adj[v]
+    w = [alpha if cluster[x] == cluster[v] else beta for x in nbrs]
+    s = sum(w); return nbrs, [wi / s for wi in w]
 
+# the full-engine - for each neighbor, multiplies node2vec × cluster × anti-return, then normalizes to probabilities.
+def cluster_node2vec_probs(t, v, p, q, alpha, beta, r):
+    nbrs = adj[v]; cv = cluster[v]
+    crossed = (t is not None) and (cluster[t] != cv)
+    ct = cluster[t] if t is not None else -1
+    w = []
+    for x in nbrs:
+        cx = cluster[x]
+        wi = alpha if cx == cv else beta
+        if t is not None:
+            if x == t:            wi /= p
+            elif x in adj_set[t]: pass
+            else:                 wi /= q
+            if crossed and cx == ct: wi *= r
+        w.append(wi)
+    s = sum(w); return nbrs, [wi / s for wi in w]
 
-# 2) The cluster-biased node2vec
-class ClusterBiasedNode2Vec(Node2Vec):
-    """
-    node2vec whose graph edges have been reweighted by a cluster-bias factor
-    ß(u, v) BEFORE the walks are generated. Everything else (p, q, the walk
-    generation, the Skip-gram training) is exactly as it is in node2vec.
-    """
-
-    def __init__(self, graph, level_maps, beta_in=2.0, beta_out=0.5,
-                 mode="multiscale", weight_key="weight", **kwargs):
-        beta = make_beta_fn(level_maps, beta_in, beta_out, mode)
-
-        # Build a reweighted copy of the graph (don't touch the original)
-        biased = graph.copy()
-        for u, v, d in biased.edges(data=True):
-            base_w = d.get(weight_key, 1.0)
-            d[weight_key] = base_w * beta(u, v)
-
-        # Hand the reweighted graph (biased = graph.copy()) to the normal node2vec
-        super().__init__(biased, weight_key=weight_key, **kwargs)
-
-
-def build_methods():
-    """Return an ordered list of (label, builder) pairs."""
-    methods = []
-    methods.append(("baseline",
-                    lambda G, lm, c: Node2Vec(G, **c)))
-    methods.append(("cluster-flat (1.25/1.0)",
-                    lambda G, lm, c: ClusterBiasedNode2Vec(
-                        G, lm, beta_in=1.25, beta_out=1.0, mode="flat", **c)))
-    methods.append(("cluster-multiscale (1.5/1.0)",
-                    lambda G, lm, c: ClusterBiasedNode2Vec(
-                        G, lm, beta_in=1.5, beta_out=1.0, mode="multiscale", **c)))
-    methods.append(("cluster-flat (2.0/0.5)",
-                    lambda G, lm, c: ClusterBiasedNode2Vec(
-                        G, lm, beta_in=2.0, beta_out=0.5, mode="flat", **c)))
-    return methods
-
-
-def plot_tsne_grid(variants, y, path, dataset, seed):
-    """variants: list of (label, acc, X). Draw a grid of t-SNE scatter panels."""
-    n = len(variants)
-    cols = 2
-    rows = (n + cols - 1) // cols
-    fig, axes = plt.subplots(rows, cols, figsize=(7 * cols, 6 * rows))
-    axes = np.array(axes).reshape(-1)
-
-    for ax, (label, acc, X) in zip(axes, variants):
-        print(f"[tsne] projecting '{label}' ...")
-        coords = TSNE(n_components=2, init="pca", learning_rate="auto",
-                      random_state=seed).fit_transform(X)
-        sc = ax.scatter(coords[:, 0], coords[:, 1], c=y, s=6, cmap="tab10", alpha=0.8)
-        ax.set_title(f"{label}\nacc={acc:.3f}", fontsize=11)
-        ax.set_xticks([]); ax.set_yticks([])
-
-    for ax in axes[n:]:          # hide any unused panel
-        ax.axis("off")
-
-    handles, labels = sc.legend_elements()
-    fig.legend(handles, labels, title="class", loc="upper right", fontsize=8)
-    fig.suptitle(f"{dataset}: node2vec vs cluster-biased variants "
-                 f"(t-SNE, seed={seed})", fontsize=14)
-    fig.tight_layout(rect=[0, 0, 1, 0.97])
-    fig.savefig(path, dpi=150)
-    plt.close(fig)
-    print(f"[tsne] grid saved -> {path}")
+# sampled reduction check 
+## a quick correctness test on 400 random walk states, confirming the full engine collapses  to plain node2vec (when α=β=1, r=1) and to the plain cluster walk (when p=q=1, r=1)
+rng = np.random.default_rng(SEED)
+states = []
+for _ in range(400):
+    v = int(rng.integers(n))
+    t = int(rng.choice(adj[v])) if adj[v] else None
+    states.append((t, v))
+def sdiff(a, b):
+    return max(max(abs(pa - pb) for pa, pb in zip(a(t, v)[1], b(t, v)[1]))
+               for t, v in states)
+d1 = sdiff(lambda t, v: cluster_node2vec_probs(t, v, 0.5, 2.0, 1.0, 1.0, 1.0),
+           lambda t, v: node2vec_probs(t, v, 0.5, 2.0))
+d2 = sdiff(lambda t, v: cluster_node2vec_probs(t, v, 1.0, 1.0, 0.5, 2.0, 1.0),
+           lambda t, v: first_order_cluster_probs(v, 0.5, 2.0))
+print(f"Sampled reduction check (400 states): "
+      f"vs Node2Vec {d1:.1e}, vs flat-cluster {d2:.1e}  "
+      f"{'PASS' if max(d1, d2) < 1e-12 else 'FAIL'}\n")
 
 
 
-# --------------------------------------------------------------------------- #
-# Runners
-# --------------------------------------------------------------------------- #
-# def fit_and_eval(n2v_obj, G, y, train_mask, test_mask, dims, window, seed, label):
-#     model = n2v_obj.fit(window=window, min_count=1, sg=1, seed=seed, workers=1)
-#     X = embeddings_to_matrix(model, G.number_of_nodes(), dims)
-#     acc = evaluate(X, y, train_mask, test_mask, seed)
-#     print(f"[eval] {label:<34} test acc = {acc:.4f}")
-#     return acc, X
+# Fast walk generation (pure-Python hot loop for speed)
+## From every node, takes steps by sampling from cluster_node2vec_probs, producing the node sequences that serve as "context."
+import random
+def generate_walks(p, q, alpha, beta, r, num_walks=10, walk_len=40, seed=0):
+    rnd = random.Random(seed)
+    inv_p, inv_q = 1.0 / p, 1.0 / q
+    walks = []
+    order = list(range(n))
+    for _ in range(num_walks):
+        rnd.shuffle(order)
+        for start in order:
+            walk = [start]
+            for _ in range(walk_len - 1):
+                v = walk[-1]; nbrs = adj[v]
+                if not nbrs:
+                    break
+                cv = cluster[v]
+                t = walk[-2] if len(walk) > 1 else None
+                if t is None:
+                    ws = [alpha if cluster[x] == cv else beta for x in nbrs]
+                else:
+                    ct = cluster[t]; Nt = adj_set[t]; crossed = ct != cv
+                    ws = []
+                    for x in nbrs:
+                        cx = cluster[x]
+                        wi = alpha if cx == cv else beta
+                        if x == t:       wi *= inv_p
+                        elif x in Nt:    pass
+                        else:            wi *= inv_q
+                        if crossed and cx == ct: wi *= r
+                        ws.append(wi)
+                tot = 0.0
+                for wi in ws: tot += wi
+                rv = rnd.random() * tot
+                acc = 0.0
+                for i in range(len(ws)):
+                    acc += ws[i]
+                    if acc >= rv:
+                        walk.append(nbrs[i]); break
+            walks.append(walk)
+    return walks
+
+# measures the oscillation: crossings per walk, how often a crossing is immediately reversed, and how many distinct nodes each walk covers.
+def walk_diagnostics(walks):
+    tot_cross = tot_recross = 0; coverage = []
+    for w in walks:
+        cl = [cluster[v] for v in w]
+        for i in range(1, len(cl)):
+            if cl[i] != cl[i - 1]:
+                tot_cross += 1
+                if i + 1 < len(cl) and cl[i + 1] == cl[i - 1]:
+                    tot_recross += 1
+        coverage.append(len(set(w)))
+    rr = tot_recross / tot_cross if tot_cross else 0.0
+    return tot_cross / len(walks), rr, float(np.mean(coverage))
 
 
-def main():
-    ap = argparse.ArgumentParser(description="Idea A: cluster-biased node2vec")
-    ap.add_argument("--dataset", default="Cora", choices=["Cora", "CiteSeer", "PubMed"])
-    ap.add_argument("--dimensions", type=int, default=128)
-    ap.add_argument("--walk_length", type=int, default=20)
-    ap.add_argument("--num_walks", type=int, default=10)
-    ap.add_argument("--window", type=int, default=10)
-    ap.add_argument("--p", type=float, default=1.0)
-    ap.add_argument("--q", type=float, default=1.0)
-    ap.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 2, 3, 4])
-    ap.add_argument("--outdir", default="results")
-    args = ap.parse_args()
+# Embedding (gensim) + evaluation over the dataset's splits
+## returns one 128-dim vector per node. The "embedding" pillar.
+def embed(walks, dim=128, window=10, epochs=1, seed=0):
+    sents = [[str(v) for v in w] for w in walks]
+    m = Word2Vec(sents, vector_size=dim, window=window, min_count=0, sg=1,
+                 negative=5, workers=4, epochs=epochs, seed=seed)
+    return np.array([m.wv[str(i)] for i in range(n)])
 
-    os.makedirs(args.outdir, exist_ok=True)
-    methods = build_methods()
-
-    # accuracies[label] = list of per-seed test accuracies
-    accuracies = {label: [] for label, _ in methods}
-    grid_variants = []   # filled on the first seed for the t-SNE grid
-
-    for si, seed in enumerate(args.seeds):
-        print(f"\n############## SEED {seed} ({si + 1}/{len(args.seeds)}) ##############")
-        set_seed(seed)
-        G, y, train_mask, test_mask = load_planetoid(args.dataset)
-        level_maps = compute_louvain_levels(G, seed)
-
-        common = dict(dimensions=args.dimensions, walk_length=args.walk_length,
-                      num_walks=args.num_walks, p=args.p, q=args.q,
-                      workers=1, seed=seed, quiet=True)
-
-        for label, builder in methods:
-            n2v = builder(G, level_maps, common)
-            model = n2v.fit(window=args.window, min_count=1, sg=1,
-                            seed=seed, workers=1)
-            X = embeddings_to_matrix(model, G.number_of_nodes(), args.dimensions)
-            acc = evaluate(X, y, train_mask, test_mask, seed)
-            accuracies[label].append(acc)
-            print(f"[eval] seed={seed}  {label:<32} acc = {acc:.4f}")
-            if si == 0:                      # keep first-seed embeddings to plot
-                grid_variants.append((label, acc, X))
+# for each of the 10 splits trains a logistic-regression classifier on the train nodes and scores accuracy on the test nodes, returning mean ± std. 
+def evaluate(X):
+    Xs = StandardScaler().fit_transform(X)
+    accs = []
+    for s in range(train_masks.shape[0]):
+        tr, te = train_masks[s], test_masks[s]
+        clf = LogisticRegression(max_iter=300, n_jobs=-1)
+        clf.fit(Xs[tr], y[tr])
+        accs.append(accuracy_score(y[te], clf.predict(Xs[te])))
+    return float(np.mean(accs)), float(np.std(accs))
 
 
-        # ---- summary: mean +/- std ------------------------------------------- #
-    print("\n================ SUMMARY: " + args.dataset +
-          f"  ({len(args.seeds)} seeds) ================")
-    print(f"{'method':<32}{'mean':>9}{'std':>9}{'min':>9}{'max':>9}")
-    stats = {}
-    for label, _ in methods:
-        a = np.array(accuracies[label])
-        mean = a.mean()
-        std = a.std(ddof=1) if len(a) > 1 else 0.0
-        stats[label] = (mean, std)
-        print(f"{label:<32}{mean:>9.4f}{std:>9.4f}{a.min():>9.4f}{a.max():>9.4f}")
+# compare the four steps
+configs = [
+    ("DeepWalk",                dict(p=1.0, q=1.0, alpha=1.0, beta=1.0, r=1.0)),
+    ("Node2Vec (q=0.5)",        dict(p=1.0, q=0.5, alpha=1.0, beta=1.0, r=1.0)),
+    ("Cluster-N2V",             dict(p=1.0, q=0.5, alpha=0.5, beta=2.0, r=1.0)),
+    ("Cluster-N2V + no-return", dict(p=1.0, q=0.5, alpha=0.5, beta=2.0, r=0.001)),
+]
 
+print("Running configs (walks -> gensim -> node classification over 10 splits):\n")
+rows = []
+for name, kw in configs:
+    t0 = time.time()
+    walks = generate_walks(**kw, seed=SEED)
+    tw = time.time() - t0
+    diag = walk_diagnostics(walks)
+    X = embed(walks, seed=SEED)
+    mean, std = evaluate(X)
+    rows.append((name, diag, mean, std))
+    print(f"  {name:26s} acc = {mean:.3f} +/- {std:.3f}   "
+          f"[recross {diag[1]:.0%}, cover {diag[2]:.0f}, walks {tw:.0f}s]")
 
-    # # (0) plain node2vec baseline
-    # print("\n=== baseline node2vec (no cluster bias) ===")
-    # base = Node2Vec(G, **common)
-    # acc, X = fit_and_eval(base, G, y, train_mask, test_mask,
-    #                       args.dimensions, args.window, args.seed,
-    #                       "baseline node2vec")
-    # results.append(("baseline", "-", "-", acc))
-    # best = {"acc": acc, "label": "baseline", "X": X}
+print("\nSummary (test accuracy on Roman-empire, mean over 10 splits):")
+print(f"  majority baseline           {majority:.3f}")
+for name, diag, mean, std in rows:
+    print(f"  {name:26s} {mean:.3f} +/- {std:.3f}")
 
-    # (1) cluster-biased variants 
-    
-    base_mean, base_std = stats["baseline"]
-    print("\n---- verdict (vs baseline) ----")
-    for label, _ in methods:
-        if label == "baseline":
-            continue
-        mean, std = stats[label]
-        diff = mean - base_mean
-        # "within noise" if the gap is smaller than the seeds' own spread
-        noise = max(base_std, std, 1e-9)
-        tag = "within noise" if abs(diff) <= noise else ("BETTER" if diff > 0 else "WORSE")
-        print(f"{label:<32} diff = {diff:+.4f}   ({tag})")
-
-    
-    # CSV Results
-    per_seed = os.path.join(args.outdir, f"{args.dataset}_idea_a_perseed.csv")
-    with open(per_seed, "w") as f:
-        f.write("dataset,method,seed,test_accuracy\n")
-        for label, _ in methods:
-            for seed, acc in zip(args.seeds, accuracies[label]):
-                f.write(f"{args.dataset},{label},{seed},{acc:.4f}\n")
-    summary = os.path.join(args.outdir, f"{args.dataset}_idea_a_summary.csv")
-    with open(summary, "w") as f:
-        f.write("dataset,method,mean_acc,std_acc,n_seeds\n")
-        for label, _ in methods:
-            mean, std = stats[label]
-            f.write(f"{args.dataset},{label},{mean:.4f},{std:.4f},{len(args.seeds)}\n")
-    print(f"\n[save] per-seed  -> {per_seed}")
-    print(f"[save] summary   -> {summary}")
-
-    # t-SNE grid (first seed)
-    grid_path = os.path.join(args.outdir, f"{args.dataset}_idea_a_tsne_grid.png")
-    plot_tsne_grid(grid_variants, y, grid_path, args.dataset, args.seeds[0])
-
-    print("\nFinished.")
-    # configs = [
-    #     ("flat",       1.25, 1.0),   # gentle: only prompt the walk to stay
-    #     ("multiscale", 1.5,  1.0),   # gentle, multi-scale (deep cluster -> stronger)
-    #     ("flat",       2.0,  0.5),   # aggressive: over-confines -> usually worse
-    # ]
-    # for mode, b_in, b_out in configs:
-
-    #     label = f"cluster-{mode} (in={b_in}, out={b_out})"
-
-    #     print(f"\n=== {label} ===")
-    #     cb = ClusterBiasedNode2Vec(G, level_maps, beta_in=b_in, beta_out=b_out,
-    #                                mode=mode, **common)
-    #     acc, X = fit_and_eval(cb, G, y, train_mask, test_mask,
-    #                           args.dimensions, args.window, args.seed, label)
-    #     results.append((f"cluster-{mode}", b_in, b_out, acc))
-    #     if acc > best["acc"]:
-    #         best = {"acc": acc, "label": label, "X": X}
-
-    # summary in a table
-    # print("\n================ SUMMARY (" + args.dataset + ") ================")
-    # print(f"{'method':<18}{'beta_in':>9}{'beta_out':>10}{'test_acc':>11}")
-    # for method, bi, bo, acc in results:
-    #     print(f"{method:<18}{str(bi):>9}{str(bo):>10}{acc:>11.4f}")
-
-    # csv_path = os.path.join(args.outdir, f"{args.dataset}_idea_a.csv")
-    # with open(csv_path, "w") as f:
-    #     f.write("dataset,method,beta_in,beta_out,test_accuracy\n")
-    #     for method, bi, bo, acc in results:
-    #         f.write(f"{args.dataset},{method},{bi},{bo},{acc:.4f}\n")
-    # print(f"\n[save] results -> {csv_path}")
-
-    # tsne_path = os.path.join(args.outdir, f"{args.dataset}_idea_a_best.png")
-    # plot_tsne(best["X"], y,
-    #           title=f"{args.dataset} {best['label']} (acc={best['acc']:.3f})",
-    #           path=tsne_path, seed=args.seed)
-
-    # print(f"\nDone. Best on {args.dataset}: {best['label']} "
-    #       f"= {best['acc']:.4f}")
-
-
-if __name__ == "__main__":
-    main()
+# bar chart
+fig, ax = plt.subplots(figsize=(8, 4.5))
+names = [r[0] for r in rows]; means = [r[2] for r in rows]; stds = [r[3] for r in rows]
+colors = ["#7f8c8d", "#2c6fbb", "#c0392b", "#27ae60"]
+ax.bar(range(len(names)), means, yerr=stds, color=colors, capsize=4,
+       edgecolor="white", linewidth=1)
+ax.axhline(majority, ls="--", c="gray", lw=1, label=f"majority ({majority:.2f})")
+ax.set_xticks(range(len(names))); ax.set_xticklabels(names, rotation=15, ha="right", fontsize=9)
+ax.set_ylabel("test accuracy"); ax.set_ylim(0, max(means) * 1.25)
+ax.set_title("Roman-empire (heterophilous): node classification", fontsize=12)
+ax.legend(fontsize=8)
+for i, (m, s) in enumerate(zip(means, stds)):
+    ax.text(i, m + s + 0.005, f"{m:.3f}", ha="center", fontsize=9)
+fig.tight_layout()
+fig.savefig("roman_empire_results.png", dpi=130, bbox_inches="tight")
+print("\nsaved figure -> roman_empire_results.png")
