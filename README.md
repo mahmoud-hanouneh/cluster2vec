@@ -89,37 +89,37 @@ python src/base/node2vec_baseline.py --dataset Cora
 # | Node2Vec                | 1.0 | 0.5 | 1.0   | 1.0  | 1.0   |
 # | Cluster-N2V             | 1.0 | 0.5 | 0.5   | 2.0  | 1.0   |
 # | Cluster-N2V + no-return | 1.0 | 0.5 | 0.5   | 2.0  | 0.001 |
+```
 
 ---
 
 ## Evaluation
 
-# Walks → gensim Skip-gram (128 dims, window 10, negative sampling) → frozen embeddings → logistic regression on standardised features, scored on each of the 10 official splits and reported as mean ± std.
+Walks → gensim Skip-gram (128 dims, window 10, negative sampling) → frozen embeddings → logistic regression on standardised features, scored on each of the 10 official splits and reported as mean ± std.
 
-# Alongside accuracy, `walk_diagnostics()` reports what the walk actually did:
+Alongside accuracy, `walk_diagnostics()` reports what the walk actually did:
 
-# - **crossings per walk** — how often it leaves its cluster at all
-# - **re-cross rate** — how often a crossing is immediately reversed (the oscillation metric)
-# - **coverage** — distinct nodes visited per walk
+- **crossings per walk** — how often it leaves its cluster at all
+- **re-cross rate** — how often a crossing is immediately reversed (the oscillation metric)
+- **coverage** — distinct nodes visited per walk
 
-# These are important because accuracy alone cannot tell whether the bias changed the walk's behaviour or just added noise.
+These are important because accuracy alone cannot tell whether the bias changed the walk's behaviour or just added noise.
 
-# <!-- ## Correctness
+<!-- ## Correctness
 
-# Both scripts verify the reductions rather than assuming them:
+Both scripts verify the reductions rather than assuming them:
 
-# - `walk_biased_node2vec.py` — **exhaustive** over every `(t, v)` state on Karate, for several `(p, q)` and `(alpha, beta)` pairs
-# - `cluster2vec.py` — **sampled** over 400 random states on Roman-empire (exhaustive is infeasible at 22k nodes)
+- `walk_biased_node2vec.py` — **exhaustive** over every `(t, v)` state on Karate, for several `(p, q)` and `(alpha, beta)` pairs
+- `cluster2vec.py` — **sampled** over 400 random states on Roman-empire (exhaustive is infeasible at 22k nodes)
 
-# Both pass at max transition-probability difference < 1e-12.
+Both pass at max transition-probability difference < 1e-12.
 
-# `cluster2vec.py` also prints the **ARI between the Louvain partition and the 18 ground-truth labels**, which is the honest diagnostic for whether the cluster bias is even pointing at the right target. -->
+`cluster2vec.py` also prints the **ARI between the Louvain partition and the 18 ground-truth labels**, which is the honest diagnostic for whether the cluster bias is even pointing at the right target. -->
 
-# ---
+---
 
 ## References
 
 - Mikolov et al., _Efficient Estimation of Word Representations in Vector Space_, 2013
 - Grover & Leskovec, _node2vec: Scalable Feature Learning for Networks_, 2016
 - Ribeiro et al., _struc2vec: Learning Node Representations from Structural Identity_, 2017
-```
