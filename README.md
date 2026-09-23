@@ -80,20 +80,18 @@ python src/helpers/clustering_methods_test.py
 # Planetoid Node2Vec baseline sweep
 python src/base/node2vec_baseline.py --dataset Cora
 
-
-# The biased-walk scripts run these configurations (same engine, different knobs):
-
-# | config                  | p   | q   | alpha | beta | r     |
-# | ----------------------- | --- | --- | ----- | ---- | ----- |
-# | DeepWalk                | 1.0 | 1.0 | 1.0   | 1.0  | 1.0   |
-# | Node2Vec                | 1.0 | 0.5 | 1.0   | 1.0  | 1.0   |
-# | Cluster-N2V             | 1.0 | 0.5 | 0.5   | 2.0  | 1.0   |
-# | Cluster-N2V + no-return | 1.0 | 0.5 | 0.5   | 2.0  | 0.001 |
 ```
 
----
+The biased-walk scripts run these configurations (same engine, different knobs):
 
-## Evaluation
+| config                  | p   | q   | alpha | beta | r     |
+| ----------------------- | --- | --- | ----- | ---- | ----- |
+| DeepWalk                | 1.0 | 1.0 | 1.0   | 1.0  | 1.0   |
+| Node2Vec                | 1.0 | 0.5 | 1.0   | 1.0  | 1.0   |
+| Cluster-N2V             | 1.0 | 0.5 | 0.5   | 2.0  | 1.0   |
+| Cluster-N2V + no-return | 1.0 | 0.5 | 0.5   | 2.0  | 0.001 |
+
+<!-- ## Evaluation
 
 Walks → gensim Skip-gram (128 dims, window 10, negative sampling) → frozen embeddings → logistic regression on standardised features, scored on each of the 10 official splits and reported as mean ± std.
 
@@ -103,7 +101,7 @@ Alongside accuracy, `walk_diagnostics()` reports what the walk actually did:
 - **re-cross rate** — how often a crossing is immediately reversed (the oscillation metric)
 - **coverage** — distinct nodes visited per walk
 
-These are important because accuracy alone cannot tell whether the bias changed the walk's behaviour or just added noise.
+These are important because accuracy alone cannot tell whether the bias changed the walk's behaviour or just added noise. -->
 
 <!-- ## Correctness
 
