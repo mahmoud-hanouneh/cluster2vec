@@ -13,7 +13,7 @@ Here we keep the walk, but we tell it about **clusters**. Before walking, we gro
 
 ---
 
-## The walk engine
+## The biased-walk engine
 
 Three independent factors multiply into one unnormalised transition weight:
 
@@ -27,14 +27,16 @@ weight(t, v → x) = α_pq(t, x) · c(v, x) · m(t, x)
 | `c(v, x)`    | cluster bias: `alpha` if `x` is in `v`'s cluster, `beta` if it is outside                                                    | `alpha`, `beta` |
 | `m(t, x)`    | anti-return: if the walk _just crossed a border_, multiply by `r` every neighbour that lies back in the cluster it came from | `r`             |
 
-The fix has to work on whole clusters, not single nodes. That is what `m` does: right after a crossing, it multiplies the weight of _every_ neighbour still sitting in the old cluster by `r`. A small `r` (example, 0.0001) makes going back very unlikely for one step, which is enough to let the walk go further to B. Setting `r = 1` turns the factor off.
+<!-- The fix has to work on whole clusters, not single nodes. That is what `m` does: right after a crossing, it multiplies the weight of _every_ neighbour still sitting in the old cluster by `r`. A small `r` (example, 0.0001) makes going back very unlikely for one step, which is enough to let the walk go further to B. Setting `r = 1` turns the factor off. -->
 
 The engine is exact by construction:
 
 - `alpha = beta = 1`, `r = 1` → collapses to plain Node2Vec
 - `p = q = 1`, `r = 1` → collapses to the flat first-order cluster walk
 
-(the _Correctness_ section in the code).
+<!-- (the _Correctness_ section in the code). -->
+
+The walk-free variant needs none of these knobs: a node's context is the nodes that share a cluster with, across a multi-scale hierarchy, with finer shared levels weighted more strongly.
 
 ---
 
@@ -42,15 +44,16 @@ The engine is exact by construction:
 
 ```
 src/
-  cluster2vec.py             MAIN experiment: full three-factor engine on Roman-empire,
-                             Louvain clustering, walk diagnostics, gensim Skip-gram,
-                             evaluation over the dataset's 10 official splits
-  walk_biased_node2vec.py    Karate prototype: the three transition rules side by side,
-                             exhaustive reduction proofs, a worked border-crossing example,
-                             hand-written numpy SGNS trainer
   base/
-    node2vec_baseline.py     plain Node2Vec q-sweep on Planetoid (Cora / CiteSeer / PubMed)
-results/                     figures for the results
+    node2vec_baseline.py           plain Node2Vec q-sweep baseline on Planetoid (Cora / CiteSeer / PubMed)
+  biased_walks/                    Approach 1 — cluster-biased Node2Vec walk (alpha, beta, anti-return r)
+    cluster2vec_hetroph_graph.py     Roman-empire (heterophilous); Louvain; sampled reduction check; walk diagnostics
+    cluster2vec_homoph_graph.py      Amazon Photo (homophilous); ARI screen; stay vs leave bias
+  walk_free/                       Approach 2 — walk-free cluster co-membership (multi-scale hierarchy)
+    cluster2vec_hetro_graph.py       Roman-empire; structural vs community co-membership
+    cluster2vec_homo_graph.py        Amazon Photo; structural vs community co-membership
+  helpers/
+    clustering_methods_test.py       ARI: Louvain vs Spectral vs Structural clustering
 requirements.txt
 ```
 
@@ -63,54 +66,60 @@ pip install -r requirements.txt
 ## Usage
 
 ```bash
-# Main run: four configurations on Roman-empire, generates roman_empire_results.png
-python src/cluster2vec.py
+# Approach 1 — cluster-biased walk
+python src/biased_walks/cluster2vec_hetroph_graph.py   # Roman-empire (heterophilous)
+python src/biased_walks/cluster2vec_homoph_graph.py    # Amazon Photo (homophilous)
 
-# Karate prototype: reduction tests + the border-crossing demo
-python src/walk_biased_node2vec.py
+# Approach 2 — walk-free co-membership
+python src/walk_free/cluster2vec_hetro_graph.py        # Roman-empire (heterophilous)
+python src/walk_free/cluster2vec_homo_graph.py         # Amazon Photo (homophilous)
 
-# Planetoid baseline sweep
+# Clustering ARI screen (which clustering aligns with the labels)
+python src/helpers/clustering_methods_test.py
+
+# Planetoid Node2Vec baseline sweep
 python src/base/node2vec_baseline.py --dataset Cora
-```
 
-`cluster2vec.py` runs four configurations:
 
-| config                  | p   | q   | alpha | beta | r     |
-| ----------------------- | --- | --- | ----- | ---- | ----- |
-| DeepWalk                | 1.0 | 1.0 | 1.0   | 1.0  | 1.0   |
-| Node2Vec                | 1.0 | 0.5 | 1.0   | 1.0  | 1.0   |
-| Cluster-N2V             | 1.0 | 0.5 | 0.5   | 2.0  | 1.0   |
-| Cluster-N2V + no-return | 1.0 | 0.5 | 0.5   | 2.0  | 0.001 |
+# The biased-walk scripts run these configurations (same engine, different knobs):
+
+# | config                  | p   | q   | alpha | beta | r     |
+# | ----------------------- | --- | --- | ----- | ---- | ----- |
+# | DeepWalk                | 1.0 | 1.0 | 1.0   | 1.0  | 1.0   |
+# | Node2Vec                | 1.0 | 0.5 | 1.0   | 1.0  | 1.0   |
+# | Cluster-N2V             | 1.0 | 0.5 | 0.5   | 2.0  | 1.0   |
+# | Cluster-N2V + no-return | 1.0 | 0.5 | 0.5   | 2.0  | 0.001 |
 
 ---
 
 ## Evaluation
 
-Walks → gensim Skip-gram (128 dims, window 10, negative sampling) → frozen embeddings → logistic regression on standardised features, scored on each of the 10 official splits and reported as mean ± std.
+# Walks → gensim Skip-gram (128 dims, window 10, negative sampling) → frozen embeddings → logistic regression on standardised features, scored on each of the 10 official splits and reported as mean ± std.
 
-Alongside accuracy, `walk_diagnostics()` reports what the walk actually did:
+# Alongside accuracy, `walk_diagnostics()` reports what the walk actually did:
 
-- **crossings per walk** — how often it leaves its cluster at all
-- **re-cross rate** — how often a crossing is immediately reversed (the oscillation metric)
-- **coverage** — distinct nodes visited per walk
+# - **crossings per walk** — how often it leaves its cluster at all
+# - **re-cross rate** — how often a crossing is immediately reversed (the oscillation metric)
+# - **coverage** — distinct nodes visited per walk
 
-These are important because accuracy alone cannot tell whether the bias changed the walk's behaviour or just added noise.
+# These are important because accuracy alone cannot tell whether the bias changed the walk's behaviour or just added noise.
 
-<!-- ## Correctness
+# <!-- ## Correctness
 
-Both scripts verify the reductions rather than assuming them:
+# Both scripts verify the reductions rather than assuming them:
 
-- `walk_biased_node2vec.py` — **exhaustive** over every `(t, v)` state on Karate, for several `(p, q)` and `(alpha, beta)` pairs
-- `cluster2vec.py` — **sampled** over 400 random states on Roman-empire (exhaustive is infeasible at 22k nodes)
+# - `walk_biased_node2vec.py` — **exhaustive** over every `(t, v)` state on Karate, for several `(p, q)` and `(alpha, beta)` pairs
+# - `cluster2vec.py` — **sampled** over 400 random states on Roman-empire (exhaustive is infeasible at 22k nodes)
 
-Both pass at max transition-probability difference < 1e-12.
+# Both pass at max transition-probability difference < 1e-12.
 
-`cluster2vec.py` also prints the **ARI between the Louvain partition and the 18 ground-truth labels**, which is the honest diagnostic for whether the cluster bias is even pointing at the right target. -->
+# `cluster2vec.py` also prints the **ARI between the Louvain partition and the 18 ground-truth labels**, which is the honest diagnostic for whether the cluster bias is even pointing at the right target. -->
 
----
+# ---
 
 ## References
 
 - Mikolov et al., _Efficient Estimation of Word Representations in Vector Space_, 2013
 - Grover & Leskovec, _node2vec: Scalable Feature Learning for Networks_, 2016
 - Ribeiro et al., _struc2vec: Learning Node Representations from Structural Identity_, 2017
+```
