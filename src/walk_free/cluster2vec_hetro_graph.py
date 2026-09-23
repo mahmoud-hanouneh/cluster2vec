@@ -52,6 +52,7 @@ def structural_features():
         F[i, 5] = tri[i]; F[i, 6] = clu[i]
     return StandardScaler().fit_transform(F)
 
+# Hirarchy of clusters
 def structural_hierarchy(level_ks=(256, 64, 16, 4), seed=SEED):
     """Nested hierarchy: k-means for the finest level, then Ward on the fine
     centroids to derive the coarser (nested) levels. Returns memb[level][node]."""
